@@ -27,7 +27,7 @@
 |----|------|------|------|
 | **运行时** | Bun | ^1.x | 替代 Node.js，内置 SQLite 驱动，可编译成单文件二进制 |
 | **后端框架** | Hono | ^4.12 | 轻量 TypeScript Web 框架，SSE 流式支持内置 |
-| **数据库** | libSQL（SQLite 文件） | @libsql/client ^0.15 | 本机 SQLite 文件，路径默认 `~/mybot/usachi.db` |
+| **数据库** | libSQL（SQLite 文件） | @libsql/client ^0.15 | 本机 SQLite 文件，路径由 `USACHI_HOME` 决定（dev 默认 `./data/mybot`，Docker 默认 `/app/data/mybot`） |
 | **ORM** | Drizzle ORM | ^0.40 | TypeScript 原生，schema-first，迁移安全 |
 | **AI SDK** | Vercel AI SDK | ai ^5.0 | 统一调用 OpenAI/Anthropic/Google，流式 + 工具调用内置 |
 | **OpenAI 适配** | @ai-sdk/openai | ^2.0 | |
@@ -86,9 +86,10 @@ my-ai-assistant/
 │   │   ├── embedding.ts         # 向量 Embedding 生成与余弦相似度计算
 │   │   ├── embedding-catalog.ts # Embedding 模型目录（按 provider 自动选择）
 │   │   ├── persona.ts           # 角色管理（getRole / setRole）
-│   │   ├── prompt-files.ts      # ~/mybot/*.md prompt 文件读写
+│   │   ├── prompt-files.ts      # $USACHI_HOME/*.md prompt 文件读写
 │   │   ├── skills.ts            # 工具注册表（initSkills / getAllSkills / registerSkill）
-│   │   ├── skill-files.ts       # 外部 SKILL.md 发现与加载（~/mybot/Skills + ~/.agents/skills）
+│   │   ├── tool-policy.ts       # OpenClaw 工具权限策略解析器（resolveToolPolicy / expandToolEntries）
+│   │   ├── skill-files.ts       # 外部 SKILL.md 发现与加载（$USACHI_HOME/Skills + ~/.agents/skills）
 │   │   ├── filesystem-tools.ts  # 文件系统 CRUD 工具（8个一等工具）
 │   │   ├── system-tools.ts      # 系统级工具（剪贴板/截图/通知/进程管理）
 │   │   ├── tools.ts             # 动态联网工具（webSearch / readWebpage）
@@ -118,7 +119,8 @@ my-ai-assistant/
 │   ├── types/
 │   │   └── config.ts            # UsachiConfig 类型定义 + DEFAULT_CONFIG
 │   ├── utils/
-│   │   └── logger.ts            # 结构化日志（写入 bot.log）
+│   │   ├── logger.ts            # 结构化日志（写入 bot.log）
+│   │   └── runtime-paths.ts     # USACHI_HOME 统一路径解析（resolveRuntimePath）
 │   └── scripts/
 │       ├── dev.ts               # 开发启动脚本（并行启动 API + Web）
 │       └── stop.ts              # 优雅停止脚本
@@ -126,8 +128,9 @@ my-ai-assistant/
 │   ├── src/
 │   │   ├── App.tsx              # 路由定义
 │   │   ├── lib/
-│   │   │   ├── api.ts           # 所有后端 API 调用（统一封装）
-│   │   │   └── store.ts         # Zustand 全局状态
+│   │   │   ├── api.ts           # 所有后端 API 调用（统一封装）+ ToolPolicy 类型 + TOOL_POLICY_PROVIDERS 常量
+│   │   │   ├── store.ts         # Zustand 全局状态
+│   │   │   └── tool-policy.ts   # 前端纯函数 helper（draft 清洗 / patch 生成 / 回填）
 │   │   ├── pages/               # 页面组件（无原生表单元素限制）
 │   │   │   ├── ChatPage.tsx
 │   │   │   ├── ConfigPage.tsx
@@ -152,7 +155,7 @@ my-ai-assistant/
 
 ## 数据库 Schema
 
-所有表使用 SQLite（libSQL）。数据库文件默认路径：`~/mybot/usachi.db`。
+所有表使用 SQLite（libSQL）。数据库文件路径由 `USACHI_HOME` 环境变量决定，默认值：`$USACHI_HOME/usachi.db`（dev 下为 `./data/mybot/usachi.db`，Docker 下为 `/app/data/mybot/usachi.db`）。`dbPath` 配置项存储相对路径（如 `usachi.db`），运行时由 `resolveRuntimePath()` 解析为绝对路径，保证同一份 `config.json` 在宿主机和容器里均可工作。
 
 ### 核心表
 
@@ -201,7 +204,10 @@ memoryVectors: { id, sourceType, sourceId, content, embedding(JSON float[]), cre
 
 ### 1. 配置管理（config-manager.ts）
 
-配置文件路径：`~/mybot/config.json`
+配置文件路径：`$USACHI_HOME/config.json`
+
+- `USACHI_HOME` 环境变量：dev 默认 `./data/mybot`，Docker 设为 `/app/data/mybot`
+- 同一份 `config.json` 和 `usachi.db` 被宿主机 dev 进程与容器共享，无需两份配置
 
 配置分区：
 
@@ -212,7 +218,7 @@ interface UsachiConfig {
     defaultLanguage: string   // "zh-CN"
     defaultModel: string      // "openai:gpt-4o"
     systemPrompt: string
-    dbPath: string            // "~/mybot/usachi.db"
+    dbPath: string            // 相对路径，默认 "usachi.db"；运行时由 resolveRuntimePath() 解析
   }
   role: { name, avatar, systemPrompt }
   models: { openai, anthropic, google: boolean; temperature, maxTokens: number }
@@ -236,6 +242,17 @@ interface UsachiConfig {
       openApp: boolean        // 打开应用，默认 true
       system: boolean         // 系统工具（剪贴板/截图等），默认 true
     }
+    policy?: {                // OpenClaw 风格工具权限策略（见 Section 4）
+      profile?: "minimal" | "chat" | "coding" | "full"
+      allow?: string[]        // 显式加入工具名或 group:xxx
+      deny?: string[]         // 显式排除，优先于 allow
+      byProvider?: {          // 按 provider 覆盖
+        [provider: string]: { profile?, allow?, deny? }
+      }
+      byModel?: {             // 按具体模型覆盖（优先级最高）
+        [modelId: string]: { profile?, allow?, deny? }
+      }
+    }
   }
   credentials: {
     telegramBotToken, openaiApiKey, openaiBaseUrl,
@@ -249,7 +266,7 @@ interface UsachiConfig {
 关键约定：
 - 配置持久化到 JSON，环境变量仅用于首次初始化/重置时的默认值填充
 - 所有模块调用 `getConfig()`（同步）获取当前配置，不直接读文件
-- 初始化流程：`loadConfig()` → 深度合并 DEFAULT_CONFIG → 写回文件
+- 初始化流程：`loadConfig()` → 深度合并 DEFAULT_CONFIG → `normalizeToolPolicy()` → 写回文件
 
 ### 2. Agent 主循环（agent.ts）
 
@@ -278,30 +295,80 @@ interface UsachiConfig {
 3. 激活度衰减：每日 5% 衰减，访问时重置
 4. 用户画像：追加到 system prompt 开头
 
-记忆提取：每轮对话结束后，异步调用 LLM 从最近 10 条消息中提取：
+记忆提取：每轮对话结束后，异步调用 LLM 对最近 10 条消息做**一次结构化提取**（JSON schema 约束输出），同时产出：
 - 新的事实三元组 → facts 表
 - 对话情景摘要 → episodes 表
 - 用户画像更新 → userProfile 表
 
-### 4. 工具权限模型（skills.ts）
+> 注：提取使用当前对话的同一模型（`getEffectiveModel()`），避免硬编码 provider 导致的额外计费。
 
-`getAllSkills(opts: { channelType?, channelUserId? })` 返回当前请求可用的工具集：
+### 4. 工具权限模型（skills.ts + tool-policy.ts）
+
+工具暴露由 `tools.policy` 配置驱动，采用 **OpenClaw 三层解析**模型，而非按消息内容猜测工具。
+
+#### 签名
+
+```typescript
+getAllSkills(opts: {
+  channelType?: string
+  channelUserId?: string
+  modelId?: string           // 实际使用的模型 ID（provider:modelName）
+}): Tool[]
+```
+
+#### 解析顺序（优先级由低到高）
 
 ```
-1. 基础内置工具（始终注册）：getCurrentTime / calculate / dataviz / generateComponent
-2. 文件系统工具：由 tools.localAccess.filesystem 控制
-3. Shell 工具：由 tools.localAccess.shell 控制
-4. 系统工具：由 tools.localAccess.system 控制
-5. 打开应用：由 tools.localAccess.openApp 控制
-6. 联网工具：由 tools.webSearch / tools.webReader.enabled 控制
-7. 浏览器工具：由 tools.browser.enabled + Chrome MCP 连接状态控制
-8. Skills 工具：loadSkill / installSkill（始终注册）
+1. global profile（tools.policy.profile）
+      ↓  覆盖
+2. byProvider（tools.policy.byProvider[provider]）
+      ↓  覆盖
+3. byModel（tools.policy.byModel[modelId]）
 ```
 
-权限判断：
-- `web` / `tui` 通道 → 视为管理员，全部工具可用
-- `telegram` / `wechat` 通道 → 若 `adminOnly=true`，需 `channelUserId === adminChatId`
-- `adminOnly=false`（个人助手默认）→ 所有通道全部放开
+每层均可包含 `profile / allow / deny` 三个字段，高层覆盖低层。同一层内 **`deny` 优先于 `allow`**。
+
+#### 内置 profile 对应工具集
+
+| profile | 包含工具 |
+|---------|---------|
+| `minimal` | getCurrentTime、calculate |
+| `chat` | minimal + dataviz、generateComponent、webSearch、readWebpage |
+| `coding` | chat + filesystem、runShellCommand、openApplication |
+| `full` | coding + system（剪贴板/截图等）+ browser |
+
+默认 profile：`coding`（`DEFAULT_TOOL_POLICY`）。
+
+#### localAccess 最终硬限制
+
+`tools.localAccess` 在策略解析后作**最后一道硬限制**：
+- `localAccess.enabled = false` → 无论策略如何，移除所有本地工具
+- `localAccess.filesystem = false` → 无论策略 allow，移除文件系统工具
+- 其余子开关同理
+
+即：策略控制"想开放什么"，`localAccess` 控制"物理上允许什么"。
+
+#### 通道权限
+
+- `web` / `tui` 通道 → 视为管理员，`localAccess.adminOnly` 不适用
+- `telegram` / `wechat` 通道 + `adminOnly=true` → 需 `channelUserId === adminChatId`
+- 缺失 channelType/channelUserId 时**不默认放行**（安全收紧）
+
+#### 配置示例
+
+```json
+"tools": {
+  "policy": {
+    "profile": "chat",
+    "byModel": {
+      "anthropic:claude-sonnet-4-5": { "profile": "coding" },
+      "anthropic:claude-haiku-4-5": { "profile": "minimal" }
+    }
+  }
+}
+```
+
+> 上例中 Haiku 只暴露 `minimal`（2 个工具），Sonnet 暴露 `coding`，其余模型暴露 `chat`。有效控制 Haiku 的 token 开销。
 
 ### 5. 工具清单
 
@@ -357,7 +424,7 @@ interface UsachiConfig {
 - 基座：`https://ilinkai.weixin.qq.com`
 - 登录：自动获取 QR 码链接 → 用户扫码 → 获得 bot_token
 - 轮询：35s 长轮询（get_updates_buf 断点续传）
-- 持久化：`~/mybot/wechat/session.json` + `contacts.json` + `sync-buf.txt`
+- 持久化：`$USACHI_HOME/wechat/session.json` + `contacts.json` + `sync-buf.txt`
 - 错误恢复：errcode -14 → 自动重新扫码
 
 ### 7. Web 服务器（server/index.ts）
@@ -458,7 +525,7 @@ src/index.ts
 ## 配置文件位置
 
 ```
-~/mybot/
+$USACHI_HOME/              # 默认：dev → ./data/mybot，Docker → /app/data/mybot
 ├── config.json              # 主配置文件（程序自动管理）
 ├── usachi.db                # SQLite 数据库
 ├── AGENTS.md                # 全局 system prompt（覆盖配置中的 systemPrompt）
@@ -503,6 +570,9 @@ bun run watchdog
 ## 环境变量（仅用于首次初始化，运行时以 JSON 配置为准）
 
 ```bash
+# 运行目录（决定 config.json / usachi.db / Skills/ 等所有数据的存储位置）
+USACHI_HOME=./data/mybot           # dev 默认值；Docker 设为 /app/data/mybot
+
 OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.openai.com/v1      # 可替换为代理
 ANTHROPIC_API_KEY=sk-ant-...
@@ -511,7 +581,7 @@ EXA_API_KEY=...
 JINA_API_KEY=jina_...
 TELEGRAM_BOT_TOKEN=...
 ADMIN_CHAT_ID=...                              # Telegram 管理员 Chat ID
-DB_PATH=                                       # 覆盖数据库路径
+DB_PATH=                                       # 覆盖数据库路径（仅首次初始化）
 ```
 
 ---
@@ -526,10 +596,13 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ~/mybot:/root/mybot   # 挂载配置/数据目录
+      - ./data:/app/data      # 宿主机 ./data 挂载到容器 /app/data，与 dev 共享同一份数据
     environment:
+      - USACHI_HOME=/app/data/mybot
       - OPENAI_API_KEY=${OPENAI_API_KEY}
 ```
+
+> dev 与 Docker 使用同一份 `./data/mybot/config.json` 和 `usachi.db`，无需维护两套配置。
 
 ---
 
@@ -546,7 +619,7 @@ services:
 3. 数据库 schema 完全按规格实现，使用 Drizzle ORM
 4. 配置系统使用 JSON 持久化，不依赖环境变量运行
 5. 四层记忆系统完整实现（工作/摘要/语义/画像）
-6. 工具权限模型使用 localAccess 配置驱动
+6. 工具权限模型使用 `tools.policy` 配置驱动（OpenClaw 三层解析：global profile → byProvider → byModel，deny 优先，localAccess 最终硬限制）
 7. 前端使用 React 19 + Vite + Tailwind CSS v4
 8. 先生成 package.json 和 tsconfig.json
 9. 然后按模块顺序：db → types → config-manager → memory → agent → skills → channels → server → web
